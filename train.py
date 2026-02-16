@@ -437,95 +437,91 @@ def train_and_evaluate(
 
 def evaluate(hps, generator, eval_loader, writer_eval):
     generator.eval()
-    
-    with torch.no_grad():
-        # Collect 15 validation samples
-        all_specs = []
-        all_spec_lengths = []
-        all_y = []
-        all_y_lengths = []
-        
-        for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths) in enumerate(eval_loader):
-            spec, spec_lengths = spec.cuda(0), spec_lengths.cuda(0)
-            y, y_lengths = y.cuda(0), y_lengths.cuda(0)
-            
-            all_specs.append(spec)
-            all_spec_lengths.append(spec_lengths)
-            all_y.append(y)
-            all_y_lengths.append(y_lengths)
-            
-            # Stop after collecting 15 samples
-            if sum(s.size(0) for s in all_specs) >= 15:
-                break
-        
-        # Concatenate and take exactly 15 samples
-        spec = torch.cat(all_specs, dim=0)[:15]
-        spec_lengths = torch.cat(all_spec_lengths, dim=0)[:15]
-        y = torch.cat(all_y, dim=0)[:15]
-        y_lengths = torch.cat(all_y_lengths, dim=0)[:15]
-        
-        y_hat, mask, latent_info = generator.module.vocoder_infer(spec, spec_lengths, max_len=None)
-        y_hat_lengths = mask.sum([1, 2]).long() * hps.data.hop_length
 
-        if hps.model.use_mel_posterior_encoder or hps.data.use_mel_posterior_encoder:
-            mel = spec
-        else:
-            mel = spec_to_mel_torch(
-                spec,
-                hps.data.filter_length,
-                hps.data.n_mel_channels,
-                hps.data.sampling_rate,
-                hps.data.mel_fmin,
-                hps.data.mel_fmax,
-            )
-        y_hat_mel = mel_spectrogram_torch(
-            y_hat.squeeze(1).float(),
-            hps.data.filter_length,
-            hps.data.n_mel_channels,
-            hps.data.sampling_rate,
-            hps.data.hop_length,
-            hps.data.win_length,
-            hps.data.mel_fmin,
-            hps.data.mel_fmax,
-        )
-    
-    # Log first 3 samples as examples
-    image_dict = {
-        "gen/mel_0": utils.plot_spectrogram_to_numpy(y_hat_mel[0].cpu().numpy()),
-        "gen/mel_1": utils.plot_spectrogram_to_numpy(y_hat_mel[1].cpu().numpy()),
-        "gen/mel_2": utils.plot_spectrogram_to_numpy(y_hat_mel[2].cpu().numpy()),
-    }
-    
-    # Add latent visualization for VAE2 mode (first 3 samples)
-    if len(latent_info) >= 2:
-        # latent_info = (z_latent, mean, log_var)
-        latent_mean = latent_info[1]
-        image_dict["gen/latent_25hz_0"] = utils.plot_spectrogram_to_numpy(
-            latent_mean[0].cpu().numpy()
-        )
-        image_dict["gen/latent_25hz_1"] = utils.plot_spectrogram_to_numpy(
-            latent_mean[1].cpu().numpy()
-        )
-        image_dict["gen/latent_25hz_2"] = utils.plot_spectrogram_to_numpy(
-            latent_mean[2].cpu().numpy()
-        )
-    
-    audio_dict = {
-        "gen/audio_0": y_hat[0, :, : y_hat_lengths[0]],
-        "gen/audio_1": y_hat[1, :, : y_hat_lengths[1]],
-        "gen/audio_2": y_hat[2, :, : y_hat_lengths[2]],
-    }
-    if global_step == 0:
-        image_dict.update({
-            "gt/mel_0": utils.plot_spectrogram_to_numpy(mel[0].cpu().numpy()),
-            "gt/mel_1": utils.plot_spectrogram_to_numpy(mel[1].cpu().numpy()),
-            "gt/mel_2": utils.plot_spectrogram_to_numpy(mel[2].cpu().numpy()),
-        })
-        audio_dict.update({
-            "gt/audio_0": y[0, :, : y_lengths[0]],
-            "gt/audio_1": y[1, :, : y_lengths[1]],
-            "gt/audio_2": y[2, :, : y_lengths[2]],
-        })
+    num_eval_samples = int(getattr(hps.train, "num_eval_samples", 15))
+    num_log_samples = int(getattr(hps.train, "num_eval_log_samples", 3))
+    if num_eval_samples <= 0 or num_log_samples <= 0:
+        generator.train()
+        return
+
+    num_log_samples = min(num_log_samples, num_eval_samples)
+    device = next(generator.parameters()).device
+
+    image_dict = {}
+    audio_dict = {}
+    logged = 0
+
+    with torch.no_grad():
+        total_processed = 0
+        for _, (_, _, spec, spec_lengths, y, y_lengths) in enumerate(eval_loader):
+            spec = spec.to(device, non_blocking=True)
+            spec_lengths = spec_lengths.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            y_lengths = y_lengths.to(device, non_blocking=True)
+
+            batch_size = spec.size(0)
+            for sample_idx in range(batch_size):
+                if total_processed >= num_eval_samples or logged >= num_log_samples:
+                    break
+
+                spec_i = spec[sample_idx : sample_idx + 1]
+                spec_len_i = spec_lengths[sample_idx : sample_idx + 1]
+                y_i = y[sample_idx : sample_idx + 1]
+                y_len_i = y_lengths[sample_idx : sample_idx + 1]
+
+                y_hat_i, mask_i, _ = generator.module.vocoder_infer(
+                    spec_i, spec_len_i, max_len=None
+                )
+                y_hat_len_i = (mask_i.sum([1, 2]).long() * hps.data.hop_length).item()
+
+                if hps.model.use_mel_posterior_encoder or hps.data.use_mel_posterior_encoder:
+                    mel_i = spec_i
+                else:
+                    mel_i = spec_to_mel_torch(
+                        spec_i,
+                        hps.data.filter_length,
+                        hps.data.n_mel_channels,
+                        hps.data.sampling_rate,
+                        hps.data.mel_fmin,
+                        hps.data.mel_fmax,
+                    )
+
+                mel_len_i = int(spec_len_i.item())
+                mel_i = mel_i[:, :, :mel_len_i]
+                y_i = y_i[:, :, : int(y_len_i.item())]
+                y_hat_i = y_hat_i[:, :, :y_hat_len_i]
+
+                y_hat_mel_i = mel_spectrogram_torch(
+                    y_hat_i.squeeze(1).float(),
+                    hps.data.filter_length,
+                    hps.data.n_mel_channels,
+                    hps.data.sampling_rate,
+                    hps.data.hop_length,
+                    hps.data.win_length,
+                    hps.data.mel_fmin,
+                    hps.data.mel_fmax,
+                )
+
+                image_dict[f"gen/mel_{logged}"] = utils.plot_spectrogram_to_numpy(
+                    y_hat_mel_i[0].cpu().numpy()
+                )
+                audio_dict[f"gen/audio_{logged}"] = y_hat_i[0]
+
+                if global_step == 0:
+                    image_dict[f"gt/mel_{logged}"] = utils.plot_spectrogram_to_numpy(
+                        mel_i[0].cpu().numpy()
+                    )
+                    audio_dict[f"gt/audio_{logged}"] = y_i[0]
+
+                logged += 1
+                total_processed += 1
+
+            if total_processed >= num_eval_samples or logged >= num_log_samples:
+                break
+
+    if logged == 0:
+        generator.train()
+        return
 
     utils.summarize(
         writer=writer_eval,
