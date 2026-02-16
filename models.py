@@ -874,7 +874,7 @@ class ResidualCouplingBlock(nn.Module):
 
 class VAE2Encoder(nn.Module):
     """
-    VAE2 Encoder: Encodes mel spectrogram (100Hz) to latent space (25Hz) with 4x downsampling.
+    VAE2 Encoder: Encodes mel spectrogram to latent space with configurable downsampling.
     Uses KL divergence loss for regularization.
     """
     def __init__(
@@ -892,6 +892,14 @@ class VAE2Encoder(nn.Module):
         self.downsample_factor = downsample_factor
         self.gin_channels = gin_channels
 
+        if self.downsample_factor < 1 or (
+            self.downsample_factor & (self.downsample_factor - 1)
+        ) != 0:
+            raise ValueError(
+                f"downsample_factor must be a positive power of 2, got {self.downsample_factor}"
+            )
+        self.num_downsample_layers = int(math.log2(self.downsample_factor))
+
         # Initial projection
         self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
         
@@ -899,15 +907,12 @@ class VAE2Encoder(nn.Module):
         # Using strided convolutions for downsampling
         self.enc_layers = nn.ModuleList()
         
-        # Downsample in 2 stages: 100Hz -> 50Hz -> 25Hz (2x each)
-        self.enc_layers.append(nn.Sequential(
-            weight_norm(nn.Conv1d(hidden_channels, hidden_channels, 4, stride=2, padding=1)),
-            nn.LeakyReLU(0.1),
-        ))
-        self.enc_layers.append(nn.Sequential(
-            weight_norm(nn.Conv1d(hidden_channels, hidden_channels, 4, stride=2, padding=1)),
-            nn.LeakyReLU(0.1),
-        ))
+        # Downsample in repeated 2x stages
+        for _ in range(self.num_downsample_layers):
+            self.enc_layers.append(nn.Sequential(
+                weight_norm(nn.Conv1d(hidden_channels, hidden_channels, 4, stride=2, padding=1)),
+                nn.LeakyReLU(0.1),
+            ))
         
         # Additional processing at 25Hz
         self.enc_proc = nn.Sequential(
@@ -977,7 +982,7 @@ class VAE2EncoderV2(nn.Module):
     Simplified version using attentions.Encoder (standard transformer) instead of Conformer
     for better gradient stability. Uses fewer WN blocks with residual scaling.
     
-    Downsamples mel spectrogram from 100Hz to 25Hz with 4x downsampling.
+    Downsamples mel spectrogram with configurable power-of-two downsampling.
     """
     def __init__(
         self,
@@ -1006,6 +1011,14 @@ class VAE2EncoderV2(nn.Module):
         self.downsample_factor = downsample_factor
         self.gin_channels = gin_channels
 
+        if self.downsample_factor < 1 or (
+            self.downsample_factor & (self.downsample_factor - 1)
+        ) != 0:
+            raise ValueError(
+                f"downsample_factor must be a positive power of 2, got {self.downsample_factor}"
+            )
+        self.num_downsample_layers = int(math.log2(self.downsample_factor))
+
         # Initial projection from mel channels to hidden
         self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
         
@@ -1025,17 +1038,41 @@ class VAE2EncoderV2(nn.Module):
             )
         self.norm_100hz = modules.LayerNorm(hidden_channels)
         
-        # Downsample 100Hz -> 50Hz
-        self.downsample_100_50 = nn.Sequential(
-            weight_norm(nn.Conv1d(hidden_channels, hidden_channels, 4, stride=2, padding=1)),
-            nn.LeakyReLU(0.1),
-        )
+        # Configurable 2x downsample stages
+        self.downsample_layers = nn.ModuleList()
+        for _ in range(self.num_downsample_layers):
+            self.downsample_layers.append(
+                nn.Sequential(
+                    weight_norm(nn.Conv1d(hidden_channels, hidden_channels, 4, stride=2, padding=1)),
+                    nn.LeakyReLU(0.1),
+                )
+            )
         
         # ============ 50Hz Stage ============
-        # WN blocks at 50Hz
-        self.wn_50hz = nn.ModuleList()
-        for i in range(n_blocks_50hz):
-            self.wn_50hz.append(
+        # Intermediate stage blocks (applied after each downsample stage except final latent stage)
+        self.wn_mid = nn.ModuleList()
+        self.norm_mid = nn.ModuleList()
+        for _ in range(max(self.num_downsample_layers - 1, 0)):
+            stage_blocks = nn.ModuleList()
+            for _ in range(n_blocks_50hz):
+                stage_blocks.append(
+                    modules.WN(
+                        hidden_channels=hidden_channels,
+                        kernel_size=wn_kernel_size,
+                        dilation_rate=wn_dilation_rate,
+                        n_layers=3,
+                        gin_channels=0,
+                        p_dropout=p_dropout,
+                    )
+                )
+            self.wn_mid.append(stage_blocks)
+            self.norm_mid.append(modules.LayerNorm(hidden_channels))
+        
+        # ============ Latent Stage ============
+        # WN blocks at latent rate for deeper local processing
+        self.wn_latent = nn.ModuleList()
+        for _ in range(n_blocks_25hz):
+            self.wn_latent.append(
                 modules.WN(
                     hidden_channels=hidden_channels,
                     kernel_size=wn_kernel_size,
@@ -1045,29 +1082,7 @@ class VAE2EncoderV2(nn.Module):
                     p_dropout=p_dropout,
                 )
             )
-        self.norm_50hz = modules.LayerNorm(hidden_channels)
-        
-        # Downsample 50Hz -> 25Hz
-        self.downsample_50_25 = nn.Sequential(
-            weight_norm(nn.Conv1d(hidden_channels, hidden_channels, 4, stride=2, padding=1)),
-            nn.LeakyReLU(0.1),
-        )
-        
-        # ============ 25Hz Stage ============
-        # WN blocks at 25Hz for deeper local processing
-        self.wn_25hz = nn.ModuleList()
-        for i in range(n_blocks_25hz):
-            self.wn_25hz.append(
-                modules.WN(
-                    hidden_channels=hidden_channels,
-                    kernel_size=wn_kernel_size,
-                    dilation_rate=wn_dilation_rate,
-                    n_layers=3,
-                    gin_channels=0,
-                    p_dropout=p_dropout,
-                )
-            )
-        self.norm_25hz = modules.LayerNorm(hidden_channels)
+        self.norm_latent = modules.LayerNorm(hidden_channels)
         
         # Simple Transformer at 25Hz (replaces Conformer for stability)
         # Uses the existing attentions.Encoder which is well-tested
@@ -1105,11 +1120,11 @@ class VAE2EncoderV2(nn.Module):
             x_lengths: [B] lengths
             g: [B, gin_channels, 1] speaker embedding
         Returns:
-            z: [B, latent_dim, T//4] sampled latent at 25Hz
-            mean: [B, latent_dim, T//4] mean
-            log_var: [B, latent_dim, T//4] log variance
-            z_mask: [B, 1, T//4] mask at 25Hz
-            z_lengths: [B] lengths at 25Hz
+            z: [B, latent_dim, T//downsample_factor] sampled latent
+            mean: [B, latent_dim, T//downsample_factor] mean
+            log_var: [B, latent_dim, T//downsample_factor] log variance
+            z_mask: [B, 1, T//downsample_factor] mask
+            z_lengths: [B] latent lengths
         """
         # Create mask for input (100Hz)
         x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
@@ -1129,30 +1144,31 @@ class VAE2EncoderV2(nn.Module):
                 x = x + 0.5 * wn_block(x, x_mask)
         x = self.norm_100hz(x)
         
-        # Downsample 100Hz -> 50Hz
-        x = self.downsample_100_50(x)
-        x_mask_50 = x_mask[:, :, ::2]
-        if x_mask_50.size(2) != x.size(2):
-            x_mask_50 = x_mask_50[:, :, :x.size(2)]
-        x = x * x_mask_50
-        
-        # ============ 50Hz Stage ============
-        for wn_block in self.wn_50hz:
-            x = x + 0.5 * wn_block(x, x_mask_50)
-        x = self.norm_50hz(x)
-        
-        # Downsample 50Hz -> 25Hz
-        x = self.downsample_50_25(x)
-        
-        # Create mask for latent (25Hz)
+        # Downsample stages
+        current_mask = x_mask
+        for stage_idx, downsample_layer in enumerate(self.downsample_layers):
+            x = downsample_layer(x)
+            current_mask = current_mask[:, :, ::2]
+            if current_mask.size(2) > x.size(2):
+                current_mask = current_mask[:, :, :x.size(2)]
+            elif current_mask.size(2) < x.size(2):
+                current_mask = F.pad(current_mask, (0, x.size(2) - current_mask.size(2)))
+            x = x * current_mask
+
+            if stage_idx < len(self.wn_mid):
+                for wn_block in self.wn_mid[stage_idx]:
+                    x = x + 0.5 * wn_block(x, current_mask)
+                x = self.norm_mid[stage_idx](x)
+
+        # Create mask for latent stage
         z_lengths = x_lengths // self.downsample_factor
         z_mask = torch.unsqueeze(commons.sequence_mask(z_lengths, x.size(2)), 1).to(x.dtype)
         x = x * z_mask
         
-        # ============ 25Hz Stage ============
-        for wn_block in self.wn_25hz:
+        # ============ Latent Stage ============
+        for wn_block in self.wn_latent:
             x = x + 0.5 * wn_block(x, z_mask)
-        x = self.norm_25hz(x)
+        x = self.norm_latent(x)
         
         # Transformer at 25Hz (simple attention, very stable)
         x = self.transformer(x, z_mask)
@@ -1180,18 +1196,19 @@ class VAE2EncoderV2(nn.Module):
         """Remove weight normalization for inference."""
         for wn_block in self.wn_100hz:
             wn_block.remove_weight_norm()
-        for wn_block in self.wn_50hz:
+        for stage_blocks in self.wn_mid:
+            for wn_block in stage_blocks:
+                wn_block.remove_weight_norm()
+        for wn_block in self.wn_latent:
             wn_block.remove_weight_norm()
-        for wn_block in self.wn_25hz:
-            wn_block.remove_weight_norm()
-        torch.nn.utils.remove_weight_norm(self.downsample_100_50[0])
-        torch.nn.utils.remove_weight_norm(self.downsample_50_25[0])
+        for downsample_layer in self.downsample_layers:
+            torch.nn.utils.remove_weight_norm(downsample_layer[0])
         torch.nn.utils.remove_weight_norm(self.post[0])
 
 
 class VAE2Upsampler(nn.Module):
     """
-    Upsampler: Upsamples latent from 25Hz to 100Hz using TransposeConv1d (4x upsample).
+    Upsampler: Upsamples latent to mel frame rate using configurable power-of-two upsampling.
     This is placed between the VAE2 encoder and the vocoder decoder.
     """
     def __init__(
@@ -1208,20 +1225,25 @@ class VAE2Upsampler(nn.Module):
         self.hidden_channels = hidden_channels
         self.upsample_factor = upsample_factor
         self.gin_channels = gin_channels
+
+        if self.upsample_factor < 1 or (
+            self.upsample_factor & (self.upsample_factor - 1)
+        ) != 0:
+            raise ValueError(
+                f"upsample_factor must be a positive power of 2, got {self.upsample_factor}"
+            )
+        self.num_upsample_layers = int(math.log2(self.upsample_factor))
         
         # Process latent before upsampling
         self.pre = nn.Conv1d(latent_dim, hidden_channels, 1)
         
-        # Upsample in 2 stages: 25Hz -> 50Hz -> 100Hz (2x each)
+        # Upsample in repeated 2x stages
         self.up_layers = nn.ModuleList()
-        self.up_layers.append(nn.Sequential(
-            weight_norm(nn.ConvTranspose1d(hidden_channels, hidden_channels, 4, stride=2, padding=1)),
-            nn.LeakyReLU(0.1),
-        ))
-        self.up_layers.append(nn.Sequential(
-            weight_norm(nn.ConvTranspose1d(hidden_channels, hidden_channels, 4, stride=2, padding=1)),
-            nn.LeakyReLU(0.1),
-        ))
+        for _ in range(self.num_upsample_layers):
+            self.up_layers.append(nn.Sequential(
+                weight_norm(nn.ConvTranspose1d(hidden_channels, hidden_channels, 4, stride=2, padding=1)),
+                nn.LeakyReLU(0.1),
+            ))
         
         # Additional processing at 100Hz
         self.post_proc = nn.Sequential(
@@ -1242,13 +1264,13 @@ class VAE2Upsampler(nn.Module):
     def forward(self, z, z_mask, target_length=None, g=None):
         """
         Args:
-            z: [B, latent_dim, T_z] latent at 25Hz
-            z_mask: [B, 1, T_z] mask at 25Hz
-            target_length: int, target length at 100Hz (optional, for matching exact mel length)
+            z: [B, latent_dim, T_z] latent features
+            z_mask: [B, 1, T_z] latent mask
+            target_length: int, target mel length (optional, for matching exact mel length)
             g: [B, gin_channels, 1] speaker embedding
         Returns:
-            x: [B, out_channels, T] features at 100Hz
-            x_mask: [B, 1, T] mask at 100Hz
+            x: [B, out_channels, T] upsampled features
+            x_mask: [B, 1, T] output mask
         """
         x = self.pre(z)
         
@@ -1748,7 +1770,7 @@ class SynthesizerTrn(nn.Module):
         self.use_vae2_bottleneck = kwargs.get("use_vae2_bottleneck", False)
         self.vae2_latent_dim = kwargs.get("vae2_latent_dim", 128)
         self.vae2_hidden_channels = kwargs.get("vae2_hidden_channels", 256)
-        self.vae2_downsample = kwargs.get("vae2_downsample", 4)  # 100Hz -> 25Hz
+        self.vae2_downsample = kwargs.get("vae2_downsample", 4)
         self.vae2_kl_weight = kwargs.get("vae2_kl_weight", 1e-4)
         
         if self.use_vae2_bottleneck:
@@ -1762,7 +1784,7 @@ class SynthesizerTrn(nn.Module):
             # )
             # ======================================================================
             
-            # VAE2 encoder V2: mel (100Hz) -> latent (25Hz)
+            # VAE2 encoder V2: mel -> latent
             # Uses WN blocks at each rate + Transformer at 25Hz for larger receptive field
             self.vae2_encoder = VAE2EncoderV2(
                 in_channels=spec_channels,
@@ -1783,7 +1805,7 @@ class SynthesizerTrn(nn.Module):
                 transformer_filter_channels=kwargs.get("vae2_transformer_filter_channels", 512),
                 p_dropout=kwargs.get("vae2_p_dropout", 0.1),
             )
-            # VAE2 upsampler: latent (25Hz) -> vocoder input (100Hz)
+            # VAE2 upsampler: latent -> vocoder input
             self.vae2_upsampler = VAE2Upsampler(
                 latent_dim=self.vae2_latent_dim,
                 out_channels=inter_channels,
@@ -1800,12 +1822,12 @@ class SynthesizerTrn(nn.Module):
         else:
             g = None
 
-        # VAE2 bottleneck mode: mel -> encoder (4x down) -> latent (25Hz) -> upsampler (4x up) -> vocoder
+        # VAE2 bottleneck mode: mel -> encoder (downsample) -> latent -> upsampler -> vocoder
         if self.use_vae2_bottleneck:
-            # Encode mel to latent space (100Hz -> 25Hz)
+            # Encode mel to latent space
             z_latent, mean, log_var, z_mask, z_lengths = self.vae2_encoder(y, y_lengths, g=g)
             
-            # Upsample latent back to mel rate (25Hz -> 100Hz)
+            # Upsample latent back to mel rate
             z_upsampled, y_mask = self.vae2_upsampler(z_latent, z_mask, target_length=y.size(2), g=g)
             
             # Random slice for vocoder training
@@ -2006,7 +2028,7 @@ class SynthesizerTrn(nn.Module):
             g = None
         
         if self.use_vae2_bottleneck:
-            # VAE2 mode: mel -> latent (25Hz) -> upsample (100Hz) -> vocoder
+            # VAE2 mode: mel -> latent -> upsample -> vocoder
             z_latent, mean, log_var, z_mask, z_lengths = self.vae2_encoder(y, y_lengths, g=g)
             # Use mean for inference (no sampling)
             z_upsampled, y_mask = self.vae2_upsampler(mean, z_mask, target_length=y.size(2), g=g)
@@ -2021,7 +2043,7 @@ class SynthesizerTrn(nn.Module):
     
     def encode_to_latent(self, y, y_lengths, sid=None):
         """
-        Encode mel spectrogram to 25Hz latent space for flow matching training.
+        Encode mel spectrogram to latent space for flow matching training.
         
         Args:
             y: [B, mel_channels, T] mel spectrogram at 100Hz
@@ -2029,7 +2051,7 @@ class SynthesizerTrn(nn.Module):
             sid: speaker id (optional)
             
         Returns:
-            latent: [B, latent_dim, T//4] latent at 25Hz (mean, deterministic)
+            latent: [B, latent_dim, T//vae2_downsample] latent (mean, deterministic)
             z_lengths: [B] latent lengths
         """
         if not self.use_vae2_bottleneck:
@@ -2046,10 +2068,10 @@ class SynthesizerTrn(nn.Module):
     
     def decode_from_latent(self, latent, latent_lengths, target_length=None, sid=None):
         """
-        Decode from 25Hz latent to audio.
+        Decode from latent to audio.
         
         Args:
-            latent: [B, latent_dim, T_z] latent at 25Hz
+            latent: [B, latent_dim, T_z] latent features
             latent_lengths: [B] latent lengths
             target_length: target mel length at 100Hz (optional)
             sid: speaker id (optional)
@@ -2068,9 +2090,9 @@ class SynthesizerTrn(nn.Module):
         # Create latent mask
         z_mask = torch.unsqueeze(commons.sequence_mask(latent_lengths, latent.size(2)), 1).to(latent.dtype)
         
-        # Compute target length if not provided (4x upsample)
+        # Compute target length if not provided
         if target_length is None:
-            target_length = latent.size(2) * 4
+            target_length = latent.size(2) * self.vae2_downsample
         
         # Upsample
         z_upsampled, y_mask = self.vae2_upsampler(latent, z_mask, target_length=target_length, g=g)
